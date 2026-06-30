@@ -1,0 +1,303 @@
+version: "3.8"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Open Source WhatsApp Business Stack
+# Evolution API · Chatwoot · n8n · PostgreSQL · Redis · Traefik
+# ──────────────────────────────────────────────────────────────────────────────
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  web:
+    external: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  evolution_data:
+  n8n_data:
+  traefik_certs:
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Traefik — Reverse proxy + automatic TLS via Let's Encrypt
+  # ────────────────────────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--log.level=INFO"
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=web"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.websecure.http.tls=true"
+      - "--entrypoints.websecure.http.tls.certresolver=letsencrypt"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/certs
+    networks:
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+      - "traefik.http.routers.traefik-dashboard.middlewares=traefik-auth"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # PostgreSQL 15 — Shared database for Chatwoot and n8n
+  # ────────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-whatsapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-whatsapp_stack}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-whatsapp} -d ${POSTGRES_DB:-whatsapp_stack}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Redis 7 — Sidekiq queue for Chatwoot + Evolution API cache
+  # ────────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Evolution API — WhatsApp multi-device connector (Baileys)
+  # ────────────────────────────────────────────────────────────────────────────
+  evolution:
+    image: atendai/evolution-api:latest
+    container_name: evolution
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Server
+      SERVER_TYPE: http
+      SERVER_PORT: 8080
+      SERVER_URL: https://evolution.${DOMAIN}
+      # Cors
+      CORS_ORIGIN: "*"
+      CORS_METHODS: POST,GET,PUT,DELETE
+      CORS_CREDENTIALS: "true"
+      # Authentication
+      AUTHENTICATION_TYPE: apikey
+      AUTHENTICATION_API_KEY: ${AUTHENTICATION_API_KEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      # Database (PostgreSQL)
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://${POSTGRES_USER:-whatsapp}:${POSTGRES_PASSWORD}@postgres:5432/evolution_api
+      DATABASE_CONNECTION_CLIENT_NAME: evolution_api
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      # Cache (Redis)
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/1
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "true"
+      CACHE_LOCAL_ENABLED: "false"
+      # Storage (local)
+      STORAGE_ENABLED: "false"
+      # Webhook global
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS: "false"
+      # Instance settings
+      DEL_INSTANCE: "false"
+      DEL_TEMP_INSTANCES: "false"
+      # Chatwoot integration (optional — configure per instance via API)
+      CHATWOOT_ENABLED: "true"
+      # QR code
+      QRCODE_LIMIT: 30
+      QRCODE_COLOR: "#198754"
+    volumes:
+      - evolution_data:/evolution/instances
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evolution.rule=Host(`evolution.${DOMAIN}`)"
+      - "traefik.http.routers.evolution.entrypoints=websecure"
+      - "traefik.http.services.evolution.loadbalancer.server.port=8080"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Chatwoot — Inbox + CRM + Live chat
+  # ────────────────────────────────────────────────────────────────────────────
+  chatwoot:
+    image: chatwoot/chatwoot:latest
+    container_name: chatwoot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Rails
+      RAILS_ENV: production
+      SECRET_KEY_BASE: ${CHATWOOT_SECRET_KEY_BASE}
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-whatsapp}:${POSTGRES_PASSWORD}@postgres:5432/chatwoot
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Frontend URL
+      FRONTEND_URL: https://chatwoot.${DOMAIN}
+      # SMTP
+      SMTP_ADDRESS: ${CHATWOOT_SMTP_ADDRESS:-smtp.gmail.com}
+      SMTP_PORT: ${CHATWOOT_SMTP_PORT:-587}
+      SMTP_USERNAME: ${CHATWOOT_SMTP_USERNAME}
+      SMTP_PASSWORD: ${CHATWOOT_SMTP_PASSWORD}
+      SMTP_ENABLE_STARTTLS_AUTO: "true"
+      SMTP_AUTHENTICATION: plain
+      MAILER_SENDER_EMAIL: ${CHATWOOT_SMTP_USERNAME}
+      # Storage
+      ACTIVE_STORAGE_SERVICE: local
+      # Features
+      ENABLE_ACCOUNT_SIGNUP: "false"
+      RAILS_LOG_TO_STDOUT: "true"
+      LOG_LEVEL: info
+      # Sidekiq concurrency
+      SIDEKIQ_CONCURRENCY: 10
+    entrypoint: docker/entrypoints/rails.sh
+    command: bundle exec rails s -p 3000 -b 0.0.0.0
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.chatwoot.rule=Host(`chatwoot.${DOMAIN}`)"
+      - "traefik.http.routers.chatwoot.entrypoints=websecure"
+      - "traefik.http.services.chatwoot.loadbalancer.server.port=3000"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Chatwoot Worker — Sidekiq background job processor
+  # ────────────────────────────────────────────────────────────────────────────
+  chatwoot-worker:
+    image: chatwoot/chatwoot:latest
+    container_name: chatwoot-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      RAILS_ENV: production
+      SECRET_KEY_BASE: ${CHATWOOT_SECRET_KEY_BASE}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-whatsapp}:${POSTGRES_PASSWORD}@postgres:5432/chatwoot
+      REDIS_URL: redis://redis:6379/0
+      FRONTEND_URL: https://chatwoot.${DOMAIN}
+      SMTP_ADDRESS: ${CHATWOOT_SMTP_ADDRESS:-smtp.gmail.com}
+      SMTP_PORT: ${CHATWOOT_SMTP_PORT:-587}
+      SMTP_USERNAME: ${CHATWOOT_SMTP_USERNAME}
+      SMTP_PASSWORD: ${CHATWOOT_SMTP_PASSWORD}
+      SMTP_ENABLE_STARTTLS_AUTO: "true"
+      MAILER_SENDER_EMAIL: ${CHATWOOT_SMTP_USERNAME}
+      ACTIVE_STORAGE_SERVICE: local
+      RAILS_LOG_TO_STDOUT: "true"
+      SIDEKIQ_CONCURRENCY: 10
+    entrypoint: docker/entrypoints/rails.sh
+    command: bundle exec sidekiq -C config/sidekiq.yml
+    networks:
+      - internal
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # n8n — Visual workflow automation
+  # ────────────────────────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Database (use PostgreSQL instead of SQLite for production)
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-whatsapp}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Authentication
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      # Encryption
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      # URLs
+      N8N_HOST: n8n.${DOMAIN}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://n8n.${DOMAIN}/
+      # Execution
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 168
+      # Timezone
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      TZ: America/Sao_Paulo
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/home/node/.n8n/import:ro
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.${DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"

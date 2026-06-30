@@ -1,0 +1,21 @@
+# Environment — never commit secrets
+.env
+.env.local
+.env.*.local
+
+# Docker volumes (if mounted locally)
+postgres_data/
+redis_data/
+evolution_data/
+n8n_data/
+traefik_certs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
